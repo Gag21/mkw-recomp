@@ -256,6 +256,27 @@ static void dispatch_barrier(VkExec *ex) {
     vk_exec_barrier(ex);
 }
 
+// A compute dispatch's storage-image stores land in the image only; the CPU-readable collision height map the
+// water writes (a pitch-linear texture the game reads for tricks and wave riding) needs its storage updated at the
+// fence. Render and copy paths mark this via vk_texture_gpu_written, but dispatches only noted the binding's fence
+// (vk_texture_storage_bound_locked), so the write-back never saw them and physics read a flat road (#410, Eglantine
+// #553 publishes the same map to guest memory after its compute pass).
+static void mark_compute_writes(VkExec *ex, const VkPipeInfo *info) {
+    for (uint32_t i = 0; i < info->n_bindings; i++) {
+        const VkPipeBinding *bd = &info->bindings[i];
+        if (bd->kind != GFX_RES_IMG || bd->type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) continue;
+        if (!bd->res || !(bd->res->flags & 4) || bd->res->slot < 0) continue;
+        uint32_t cnt = bd->count ? bd->count : 1;
+        for (uint32_t k = 0; k < cnt; k++) {
+            int slot = bd->res->slot + (int)k;
+            if (slot < 0 || slot >= 32) continue;
+            uint64_t h = ex->img[NVN_STAGE_CS][slot];
+            if (!h) continue;
+            vk_texture_compute_written((int)(h & 0xfffff));
+        }
+    }
+}
+
 static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
@@ -292,6 +313,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (pt) vk_pt_mark(ex->cb, 0);
     ex->recorded++;
     ex->last_dispatch = ex->recorded;
+    mark_compute_writes(ex, info);
     vk_trace_3d_writes(ex, cs, info, d);
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, d);
     if (vk_rtstats_on) vk_rtstats_dispatch(ex, info);
@@ -340,6 +362,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     vk_crumb_end(ex->cb, VK_CRUMB_DISPATCH, crumb);
     vk_cs_hash(ex, d->caller, 0, 1);
     ex->recorded++;
+    mark_compute_writes(ex, info);
     vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDispatchIndirectCommand));
     VK_MEM_BOUND(ip);
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, &(p_dispatch){0, 0, 0, d->caller});
